@@ -65,8 +65,8 @@ def browser_request(url, *, method="GET", body=None, headers=None, semantics="wr
                  headers=headers or {}, semantics=semantics)
 
 
-def observe(**kwargs):
-    return _call("harness.observe", **kwargs)
+def observe(selector="body", **kwargs):
+    return _call("harness.observe", selector=selector, **kwargs)
 
 
 def find(selector, **kwargs):
@@ -119,6 +119,10 @@ def wait_for_load():
 
 def capture_screenshot():
     return _call("harness.screenshot")
+
+
+def screenshot():
+    return capture_screenshot()
 
 
 def upload_file(selector, path):

@@ -16,6 +16,7 @@ import threading
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+import browser_harness
 from browser_harness import sdk
 
 
@@ -71,6 +72,8 @@ def main():
 
     api = Namespace()
     api.input = config.get("input")
+    # Imports and pre-injected globals share the same run-scoped gateway.
+    browser_harness.api = browser_harness.td = api
     workspace = Path.cwd()
     env = {"__name__": "__agent__", "api": api, "td": api}
 

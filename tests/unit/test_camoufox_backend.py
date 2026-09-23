@@ -37,9 +37,26 @@ class CamoufoxBackendTests(IsolatedAsyncioTestCase):
         target.fill.assert_awaited_once_with("data", timeout=5)
         self.assertEqual(result, {"url": page.url})
 
+    async def test_missing_target_fails_before_dispatch(self):
+        click = AsyncMock(side_effect=TimeoutError("target absent"))
+        page = SimpleNamespace(locator=Mock(return_value=SimpleNamespace(click=click)))
+        with self.assertRaises(backend.TargetNotReadyError):
+            await backend.execute(page, "click", {"selector": "a", "timeoutMs": 50})
+        click.assert_awaited_once_with(trial=True, timeout=50)
+
     async def test_failed_effects_propagate_without_retry(self):
-        click = AsyncMock(side_effect=TimeoutError("outcome unknown"))
+        click = AsyncMock(side_effect=[None, TimeoutError("outcome unknown")])
         page = SimpleNamespace(locator=Mock(return_value=SimpleNamespace(click=click)))
         with self.assertRaises(TimeoutError):
             await backend.execute(page, "click", {"selector": "button"})
-        click.assert_awaited_once()
+        self.assertEqual(click.await_count, 2)
+        self.assertTrue(click.await_args_list[0].kwargs["trial"])
+        self.assertNotIn("trial", click.await_args_list[1].kwargs)
+
+    async def test_successful_click_dispatches_once_with_remaining_budget(self):
+        click = AsyncMock()
+        page = SimpleNamespace(url="https://fixture.test", locator=Mock(return_value=SimpleNamespace(click=click)))
+        self.assertEqual(await backend.execute(page, "click", {"selector": '[role="link"]'}), {"url": page.url})
+        self.assertEqual(click.await_count, 2)
+        self.assertGreater(click.await_args.kwargs["timeout"], 0)
+        self.assertLessEqual(click.await_args.kwargs["timeout"], 15000)

@@ -4,8 +4,13 @@ This module intentionally does not launch a browser or depend on CDP. Both the
 Python agent and compiled JavaScript call these primitives through the host.
 """
 import base64
+import time
 
-VERSION = "camoufox-harness-v2"
+VERSION = "camoufox-harness-v3"
+
+
+class TargetNotReadyError(Exception):
+    """The target check failed before any click was dispatched."""
 
 
 async def execute(page, method, args):
@@ -68,7 +73,19 @@ async def execute(page, method, args):
           } finally { clearTimeout(timer); }
         }""", {"url": args["url"], "method": args.get("method", "GET"), "body": args.get("body"), "headers": args.get("headers", {}), "timeout": timeout})
     if method == "click":
-        await frame.locator(args["selector"]).click(timeout=timeout)
+        target = frame.locator(args["selector"])
+        started = time.monotonic()
+        try:
+            # Trial performs Playwright's target/actionability checks without
+            # dispatching input. A missing selector cannot have saved a record.
+            await target.click(trial=True, timeout=timeout)
+        except Exception as error:
+            raise TargetNotReadyError() from error
+        remaining = timeout - (time.monotonic() - started) * 1000
+        if remaining <= 0:
+            raise TargetNotReadyError()
+        # Once dispatch begins, failures remain uncertain. Never retry here.
+        await target.click(timeout=max(1, int(remaining)))
     elif method == "fill":
         await frame.locator(args["selector"]).fill(args["text"], timeout=timeout)
     elif method == "click_at_xy":
