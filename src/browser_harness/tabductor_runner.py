@@ -23,9 +23,12 @@ def main():
     wire_out.flush()
     config = json.loads(wire_in.readline())
     sequence, parents = 0, []
+    loading_helper = False
 
     def call(name, args=None):
         nonlocal sequence
+        if loading_helper:
+            raise RuntimeError("Browser/workflow operations belong inside helper functions, not module initialization")
         if name == "helpers.define":
             helper_name, source = args["name"], args["source"]
             tree = ast.parse(source)
@@ -76,10 +79,15 @@ def main():
         return wrapped
 
     def install(item):
+        nonlocal loading_helper
         scope = dict(env)
         call("helpers.use", {"name": item["name"], "revision": item["revision"]})
-        with contextlib.redirect_stdout(sys.stderr):
-            exec(compile(item["source"], f"{item['name']}.py", "exec"), scope)
+        loading_helper = True
+        try:
+            with contextlib.redirect_stdout(sys.stderr):
+                exec(compile(item["source"], f"{item['name']}.py", "exec"), scope)
+        finally:
+            loading_helper = False
         if item["name"] == "agent_helpers":
             env.update({k: wrap(v, item) for k, v in scope.items()
                         if not k.startswith("_") and getattr(v, "__globals__", None) is scope and k not in env})
@@ -111,7 +119,13 @@ def main():
         "upload_file": lambda selector, path: api.harness.upload(selector=selector, name=Path(path).name,
             base64=__import__("base64").b64encode(Path(path).read_bytes()).decode("ascii")),
     })
-    scopes = [install(item) for item in config.get("helpers", [])]
+    scopes = []
+    for item in config.get("helpers", []):
+        try:
+            scopes.append(install(item))
+        except Exception as error:
+            # A broken module must not prevent a later cell from repairing it.
+            print(f"Could not load helper {item['name']}: {error}", file=sys.stderr)
     for scope in scopes:
         scope.update({name: value for name, value in env.items() if not name.startswith("_")})
     # Persist edits to agent_helpers.py as a single task-scoped module revision.
