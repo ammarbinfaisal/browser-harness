@@ -5,7 +5,7 @@ Python agent and compiled JavaScript call these primitives through the host.
 """
 import base64
 
-VERSION = "camoufox-harness-v1"
+VERSION = "camoufox-harness-v2"
 
 
 async def execute(page, method, args):
@@ -16,6 +16,13 @@ async def execute(page, method, args):
             raise ValueError("frameUrl must identify exactly one current frame")
         frame = matches[0]
     timeout = min(max(int(args.get("timeoutMs", 15000)), 1), 120000)
+    if method == "page_info":
+        return await page.evaluate("""() => ({url:location.href,title:document.title,
+          w:innerWidth,h:innerHeight,sx:scrollX,sy:scrollY,
+          pw:document.documentElement.scrollWidth,ph:document.documentElement.scrollHeight})""")
+    if method == "accessibility_tree":
+        target = frame.locator(args.get("selector", "body"))
+        return {"tree": await target.aria_snapshot(timeout=timeout), "bounds": await target.bounding_box(timeout=timeout)}
     if method == "observe":
         selector = args.get("selector", "body")
         target = frame.locator(selector)
@@ -33,8 +40,33 @@ async def execute(page, method, args):
                            "visible": await item.is_visible()})
         return {"count": count, "elements": result}
     if method == "js":
-        # Explicit evaluation is an opaque effect, never silently treated as a read.
-        return await frame.evaluate(args["expression"], args.get("argument"))
+        # Preserve statement completion values as well as expression/function calls.
+        # Parse before execution so a failed expression cannot execute effects twice.
+        return await frame.evaluate("""mw:async ({source, argument}) => {
+          let expression;
+          try { expression = new Function('argument', 'return (' + source + '\\n)'); }
+          catch (error) { if (!(error instanceof SyntaxError)) throw error; }
+          if (expression) {
+            const value = expression(argument);
+            return await (typeof value === 'function' ? value(argument) : value);
+          }
+          return await (0,eval)(source);
+        }""", {"source": args["expression"], "argument": args.get("argument")})
+    if method == "request":
+        return await frame.evaluate("""mw:async ({url,method,body,headers,timeout}) => {
+          const target = new URL(url, location.href);
+          if (target.origin !== location.origin || !['http:','https:'].includes(target.protocol)) throw new Error('Browser requests must be same-origin');
+          const controller = new AbortController();
+          const timer = setTimeout(() => controller.abort(), timeout);
+          try {
+            const response = await fetch(target.href, {method, credentials:'same-origin',redirect:'error',
+              headers: {'Content-Type':'application/json', ...headers},
+              ...(body == null ? {} : {body: typeof body === 'string' ? body : JSON.stringify(body)}),signal:controller.signal});
+            const text = await response.text();
+            let data; try { data = JSON.parse(text); } catch { data = text; }
+            return {status:response.status,ok:response.ok,url:response.url,data};
+          } finally { clearTimeout(timer); }
+        }""", {"url": args["url"], "method": args.get("method", "GET"), "body": args.get("body"), "headers": args.get("headers", {}), "timeout": timeout})
     if method == "click":
         await frame.locator(args["selector"]).click(timeout=timeout)
     elif method == "fill":
@@ -44,7 +76,19 @@ async def execute(page, method, args):
     elif method == "type_text":
         await page.keyboard.insert_text(args["text"])
     elif method == "press_key":
-        await page.keyboard.press(args["key"])
+        names = [(1, "Alt"), (2, "Control"), (4, "Meta"), (8, "Shift")]
+        prefix = [name for bit, name in names if int(args.get("modifiers", 0)) & bit]
+        await page.keyboard.press("+".join(prefix + [args["key"]]))
+    elif method == "clipboard_write":
+        page._harness_clipboard = args["text"]
+    elif method == "paste":
+        text = args.get("text", getattr(page, "_harness_clipboard", ""))
+        handled = await page.evaluate("""text => {
+          const data = new DataTransfer(); data.setData('text/plain', text);
+          return !document.activeElement.dispatchEvent(new ClipboardEvent('paste', {clipboardData:data,bubbles:true,cancelable:true}));
+        }""", text)
+        if not handled:
+            await page.keyboard.insert_text(text)
     elif method == "scroll":
         await page.mouse.move(args.get("x", 0), args.get("y", 0))
         await page.mouse.wheel(args.get("dx", 0), args.get("dy", 300))

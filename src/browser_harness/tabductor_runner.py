@@ -10,7 +10,13 @@ import functools
 import json
 import sys
 import traceback
+import base64
+import subprocess
+import threading
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from browser_harness import sdk
 
 
 class Terminal(BaseException):
@@ -19,7 +25,7 @@ class Terminal(BaseException):
 
 def main():
     wire_in, wire_out = sys.stdin, sys.stdout
-    wire_out.write(json.dumps({"type": "ready"}) + "\n")
+    wire_out.write(json.dumps({"type": "ready", "protocolVersion": 2, "sdkVersion": "browser-harness-python-v2"}) + "\n")
     wire_out.flush()
     config = json.loads(wire_in.readline())
     sequence, parents = 0, []
@@ -37,7 +43,8 @@ def main():
             if helper_name != "agent_helpers" and not any(isinstance(node, ast.FunctionDef) and node.name == helper_name for node in tree.body):
                 raise ValueError(f"Helper must define {helper_name}")
         sequence += 1
-        wire_out.write(json.dumps({"type": "call", "id": sequence, "name": name, "args": args or {}, "parent": parents[-1] if parents else None}) + "\n")
+        wire_out.write(json.dumps({"type": "call", "id": sequence, "name": name, "args": args or {}, "parent": parents[-1] if parents else None,
+                                   "sdkCallId": sdk._parents[-1] if sdk._parents else None}) + "\n")
         wire_out.flush()
         response = json.loads(wire_in.readline())
         if response.get("id") != sequence:
@@ -98,27 +105,48 @@ def main():
         env[item["name"]] = wrap(fn, item)
         return scope
 
-    # Familiar upstream helper names; browser implementation is supplied by Camoufox.
-    env.update({
-        "goto_url": lambda url: api.page.goto(url=url),
-        "page_info": lambda: api.harness.observe(),
-        "observe": lambda **kwargs: api.harness.observe(**kwargs),
-        "find": lambda selector, **kwargs: api.harness.find(selector=selector, **kwargs),
-        "click": lambda selector, **kwargs: api.harness.click(selector=selector, **kwargs),
-        "click_at_xy": lambda x, y, **kwargs: api.harness.click_at_xy(x=x, y=y, **kwargs),
-        "fill_input": lambda selector, text, **kwargs: api.harness.fill(selector=selector, text=text, **kwargs),
-        "type_text": lambda text: api.harness.type_text(text=text),
-        "press_key": lambda key: api.harness.press_key(key=key),
-        "scroll": lambda x=0, y=0, dy=300, dx=0: api.harness.scroll(x=x, y=y, dy=dy, dx=dx),
-        "js": lambda expression, argument=None, **kwargs: api.harness.js(expression=expression, argument=argument, **kwargs),
-        "capture_screenshot": lambda: api.harness.screenshot(),
-        "list_tabs": lambda: api.tabs.list(),
-        "switch_tab": lambda target: api.tabs.switch(id=target),
-        "wait_for_load": lambda: api.page.waitForLoadState(state="load"),
-        "wait_for_element": lambda selector, **kwargs: api.harness.wait_for_element(selector=selector, **kwargs),
-        "upload_file": lambda selector, path: api.harness.upload(selector=selector, name=Path(path).name,
-            base64=__import__("base64").b64encode(Path(path).read_bytes()).decode("ascii")),
-    })
+    def sdk_record(event):
+        wire_out.write(json.dumps({"type": "sdk", "event": event}) + "\n")
+        wire_out.flush()
+    sdk.bind(call, sdk_record)
+    env.update({name: getattr(sdk, name) for name in sdk.__all__})
+    files_before = config.get("workspace")
+    if files_before is not None:
+        for existing in workspace.rglob("*"):
+            if existing.is_symlink() or existing.is_file():
+                existing.unlink()
+        for name in files_before:
+            item = call("workspace.read", {"path": name})
+            destination = workspace / name
+            if not destination.resolve().is_relative_to(workspace.resolve()):
+                raise ValueError("Invalid workspace path")
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_bytes(base64.b64decode(item["content"], validate=True)
+                                    if item["encoding"] == "base64" else item["content"].encode())
+
+    def checkpoint_files():
+        if files_before is None:
+            return
+        files, total = {}, 0
+        for item in sorted(workspace.rglob("*")):
+            if item.is_symlink():
+                raise ValueError("Workspace snapshots cannot contain symlinks")
+            if not item.is_file() or "__pycache__" in item.parts:
+                continue
+            if item.stat().st_size > 8_000_000:
+                raise ValueError("Workspace file exceeds 8 MB")
+            data = item.read_bytes()
+            total += len(data)
+            if total > 32_000_000 or len(files) >= 256:
+                raise ValueError("Workspace budget exceeded")
+            try:
+                value = {"content": data.decode("utf8"), "encoding": "utf8"}
+            except UnicodeDecodeError:
+                value = {"content": base64.b64encode(data).decode(), "encoding": "base64"}
+            files[item.relative_to(workspace).as_posix()] = value
+        call("workspace.commit", {"files": files})
+
+    api.checkpoint_files = checkpoint_files
     scopes = []
     for item in config.get("helpers", []):
         try:
@@ -131,23 +159,58 @@ def main():
     # Persist edits to agent_helpers.py as a single task-scoped module revision.
     library = next((h for h in config.get("helpers", []) if h["name"] == "agent_helpers"), None)
     (workspace / "agent_helpers.py").write_text(library["source"] if library else "")
+    result = {"type": "result", "ok": True}
     try:
         with contextlib.redirect_stdout(sys.stderr):
             exec(compile(config["source"], "browser.py", "exec"), env)
     except Terminal:
-        wire_out.write(json.dumps({"type": "result", "ok": True}) + "\n")
-        wire_out.flush()
-        return
+        pass
     except BaseException:
-        wire_out.write(json.dumps({"type": "result", "ok": False, "error": traceback.format_exc(limit=8)[-4000:]}) + "\n")
-        wire_out.flush()
-        return
-    changed = (workspace / "agent_helpers.py").read_text()
-    if changed and changed != (library["source"] if library else ""):
-        call("helpers.define", {"name": "agent_helpers", "source": changed})
-    wire_out.write(json.dumps({"type": "result", "ok": True}) + "\n")
+        result = {"type": "result", "ok": False, "error": traceback.format_exc(limit=8)[-4000:]}
+    try:
+        checkpoint_files()
+        changed = (workspace / "agent_helpers.py").read_text()
+        if changed != (library["source"] if library else ""):
+            call("helpers.define", {"name": "agent_helpers", "source": changed or "# empty helper module\n"})
+    except BaseException:
+        result = {"type": "result", "ok": False, "error": traceback.format_exc(limit=8)[-4000:]}
+    wire_out.write(json.dumps(result) + "\n")
     wire_out.flush()
 
 
+def supervise():
+    """One sandbox per run; each submitted cell has a fresh interpreter."""
+    for config in sys.stdin:
+        child = subprocess.Popen([sys.executable, "-I", __file__], stdin=subprocess.PIPE,
+                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        def stderr():
+            for line in child.stderr:
+                sys.stderr.write(line)
+                sys.stderr.flush()
+        output = threading.Thread(target=stderr)
+        output.start()
+        child.stdin.write(config)
+        child.stdin.flush()
+        result = None
+        for line in child.stdout:
+            message = json.loads(line)
+            if message.get("type") == "result":
+                result = line
+                continue
+            sys.stdout.write(line)
+            sys.stdout.flush()
+            if message.get("type") == "call":
+                response = sys.stdin.readline()
+                if not response:
+                    child.kill()
+                    break
+                child.stdin.write(response)
+                child.stdin.flush()
+        child.wait()
+        output.join()
+        sys.stdout.write(result or json.dumps({"type": "result", "ok": False, "error": "Python process terminated; inspect the effect journal"}) + "\n")
+        sys.stdout.flush()
+
+
 if __name__ == "__main__":
-    main()
+    supervise() if "--supervise" in sys.argv else main()
