@@ -73,6 +73,11 @@ def find(selector, **kwargs):
     return _call("harness.find", selector=selector, **kwargs)
 
 
+def extract(selector, fields, limit=50):
+    """Read relative text/attribute fields from each matching record."""
+    return _call("harness.extract", selector=selector, fields=fields, limit=limit)
+
+
 def click(selector, **kwargs):
     return _call("harness.click", selector=selector, **kwargs)
 

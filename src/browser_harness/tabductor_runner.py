@@ -74,6 +74,8 @@ def main():
     api.input = config.get("input")
     # Imports and pre-injected globals share the same run-scoped gateway.
     browser_harness.api = browser_harness.td = api
+    for name in ("page", "harness", "tabs", "network", "destination", "record", "checkpoint", "memory", "helpers", "workspace", "output"):
+        setattr(browser_harness, name, getattr(api, name))
     workspace = Path.cwd()
     env = {"__name__": "__agent__", "api": api, "td": api}
 
