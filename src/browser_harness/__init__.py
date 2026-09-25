@@ -1,2 +1,1 @@
-"""Browser Harness core package."""
-from .sdk import *  # noqa: F403
+"""Run-scoped page, context, expect and workflow are injected by tabductor_runner."""
