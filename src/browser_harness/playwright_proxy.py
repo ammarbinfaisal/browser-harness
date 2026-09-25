@@ -314,6 +314,7 @@ WORKFLOW_METHODS = {
     "secrets.fill", "done", "fail", "deopt", "describe", "yield_control",
     "captcha.providers", "captcha.create_task", "captcha.get_result", "captcha.wait",
     "captcha.solve", "captcha.push_variable",
+    "browser.ai",
 }
 
 
@@ -329,8 +330,17 @@ class Workflow:
             raise AttributeError(f"Unknown workflow method: {path}")
         return Workflow(self._transport, path)
 
-    def __call__(self, args=None, **kwargs):
+    def __call__(self, *args, **kwargs):
         if self._path not in WORKFLOW_METHODS:
             raise TypeError("Select a workflow method")
-        return self._transport.decode(self._transport.call("workflow." + self._path,
-                                      self._transport.encode(args if args is not None else kwargs)))
+        name = self._path if self._path == "browser.ai" else "workflow." + self._path
+        if self._path == "browser.ai" and args:
+            if len(args) != 2 or kwargs:
+                raise TypeError("browser.ai(prompt, schema_def) expects exactly two positional arguments")
+            payload = {"prompt": args[0], "schema_def": args[1]}
+        elif len(args) > 1:
+            raise TypeError("Workflow methods accept at most one positional argument")
+        else:
+            payload = args[0] if args else kwargs
+        return self._transport.decode(self._transport.call(name,
+                                      self._transport.encode(payload)))
