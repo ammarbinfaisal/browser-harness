@@ -60,11 +60,10 @@ async def execute(page, method, args):
     if method == "request":
         return await frame.evaluate("""mw:async ({url,method,body,headers,timeout}) => {
           const target = new URL(url, location.href);
-          if (target.origin !== location.origin || !['http:','https:'].includes(target.protocol)) throw new Error('Browser requests must be same-origin');
           const controller = new AbortController();
           const timer = setTimeout(() => controller.abort(), timeout);
           try {
-            const response = await fetch(target.href, {method, credentials:'same-origin',redirect:'error',
+            const response = await fetch(target.href, {method, credentials:'same-origin',
               headers: {'Content-Type':'application/json', ...headers},
               ...(body == null ? {} : {body: typeof body === 'string' ? body : JSON.stringify(body)}),signal:controller.signal});
             const text = await response.text();

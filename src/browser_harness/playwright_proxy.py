@@ -307,18 +307,15 @@ class Transport:
             raise TypeError("Use synchronous callbacks with the synchronous browser API")
         return self.encode(result)
 
-WORKFLOW_METHODS = {
-    "emit", "emit.batch", "destination.contract.read", "destination.contract.publish",
-    "record.outcome",
-    "memory.get", "memory.set", "history.read", "output.read", "human_action.request",
+BROWSER_METHODS = {
+    "emit", "emit.batch", "record.outcome",
+    "memory.get", "memory.set", "history.read", "output.read",
     "secrets.fill", "done", "fail", "deopt", "describe", "yield_control",
-    "captcha.providers", "captcha.create_task", "captcha.get_result", "captcha.wait",
-    "captcha.solve", "captcha.push_variable",
-    "browser.ai",
+    "ai",
 }
 
 
-class Workflow:
+class BrowserServices:
     def __init__(self, transport, path="", input=None):
         self._transport, self._path = transport, path
         if not path:
@@ -326,20 +323,20 @@ class Workflow:
 
     def __getattr__(self, name):
         path = f"{self._path}.{name}" if self._path else name
-        if not any(p == path or p.startswith(path + ".") for p in WORKFLOW_METHODS):
-            raise AttributeError(f"Unknown workflow method: {path}")
-        return Workflow(self._transport, path)
+        if not any(p == path or p.startswith(path + ".") for p in BROWSER_METHODS):
+            raise AttributeError(f"Unknown browser method: {path}")
+        return BrowserServices(self._transport, path)
 
     def __call__(self, *args, **kwargs):
-        if self._path not in WORKFLOW_METHODS:
-            raise TypeError("Select a workflow method")
-        name = self._path if self._path == "browser.ai" else "workflow." + self._path
-        if self._path == "browser.ai" and args:
+        if self._path not in BROWSER_METHODS:
+            raise TypeError("Select a browser method")
+        name = "browser." + self._path if self._path == "ai" else "workflow." + self._path
+        if self._path == "ai" and args:
             if len(args) != 2 or kwargs:
                 raise TypeError("browser.ai(prompt, schema_def) expects exactly two positional arguments")
             payload = {"prompt": args[0], "schema_def": args[1]}
         elif len(args) > 1:
-            raise TypeError("Workflow methods accept at most one positional argument")
+            raise TypeError("Browser service methods accept at most one positional argument")
         else:
             payload = args[0] if args else kwargs
         return self._transport.decode(self._transport.call(name,

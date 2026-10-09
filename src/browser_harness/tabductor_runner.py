@@ -18,7 +18,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import browser_harness
 from browser_harness.playwright_proxy import (
-    BrowserError, BrowserTimeoutError, PUBLIC_EXPORTS, Transport, Workflow, install_sync_api,
+    BrowserError, BrowserTimeoutError, BrowserServices, PUBLIC_EXPORTS, Transport, install_sync_api,
 )
 
 
@@ -26,8 +26,8 @@ class Terminal(BaseException):
     pass
 
 
-class WorkflowError(Exception):
-    """A rejected workflow API call, not a bug in the submitted Python program."""
+class ServiceError(Exception):
+    """A rejected browser service call, not a bug in the submitted Python program."""
 
 
 def validate_compiled_source(source):
@@ -48,7 +48,7 @@ def validate_compiled_source(source):
                 raise ValueError("Only playwright.sync_api can be imported")
             if module == "playwright.sync_api" and any(n.name not in PUBLIC_EXPORTS for n in node.names):
                 raise ValueError("Only public browser objects can be imported")
-            if module == "browser_harness" and any(n.name not in {"expect", "page", "context", "workflow", "browser"} for n in node.names):
+            if module == "browser_harness" and any(n.name not in {"expect", "page", "context", "browser"} for n in node.names):
                 raise ValueError("Only public browser objects can be imported")
         if isinstance(node, ast.Attribute) and node.attr.startswith("_"):
             raise ValueError("Compiled programs cannot access runtime internals")
@@ -91,7 +91,7 @@ class Interpreter:
 
     def call(self, name, args=None):
         if self.loading_helper and not name.startswith("internal."):
-            raise RuntimeError("Browser/workflow operations belong inside helper functions, not module initialization")
+            raise RuntimeError("Browser operations belong inside helper functions, not module initialization")
         if name == "internal.helpers.define":
             helper_name, source = args["name"], args["source"]
             tree = ast.parse(source)
@@ -135,7 +135,7 @@ class Interpreter:
             if name.startswith("playwright."):
                 error_type = BrowserTimeoutError if result.get("code") == "browser_timeout" else BrowserError
             else:
-                error_type = WorkflowError if name.startswith("workflow.") else RuntimeError
+                error_type = ServiceError if name.startswith(("workflow.", "browser.")) else RuntimeError
             raise error_type(result.get("error", "Operation failed"))
         return result.get("value")
 
@@ -143,12 +143,11 @@ class Interpreter:
         if not self.initialized:
             roots = self.transport.decode(self.call("playwright.open"))
             self.page, self.context = roots["page"], roots["context"]
-            self.workflow = Workflow(self.transport, input=config.get("input"))
-            self.browser = Workflow(self.transport, path="browser")
+            self.browser = BrowserServices(self.transport, input=config.get("input"))
             install_sync_api(self.transport, self.page, self.context)
             browser_harness.page, browser_harness.context = self.page, self.context
-            browser_harness.expect, browser_harness.workflow, browser_harness.browser = self.transport.expect, self.workflow, self.browser
-            self.env.update(page=self.page, context=self.context, expect=self.transport.expect, workflow=self.workflow, browser=self.browser)
+            browser_harness.expect, browser_harness.browser = self.transport.expect, self.browser
+            self.env.update(page=self.page, context=self.context, expect=self.transport.expect, browser=self.browser)
             files = config.get("workspace")
             self.files_enabled = files is not None
             if files is not None:
@@ -163,7 +162,7 @@ class Interpreter:
             sys.path.insert(0, str(self.workspace))
             self.initialized = True
         # Input belongs to the current call even when user variables are retained.
-        self.workflow.input = config.get("input")
+        self.browser.input = config.get("input")
 
     def wrap(self, fn, item):
         @functools.wraps(fn)
@@ -257,12 +256,12 @@ class Interpreter:
             with contextlib.redirect_stdout(self.output), contextlib.redirect_stderr(self.output):
                 exec(program, self.env)
                 if config.get("compiled"):
-                    self.env["run"](self.page, self.context, self.workflow)
+                    self.env["run"](self.page, self.context, self.browser)
         except Terminal:
             pass
         except BaseException as error:
             result = {"type": "result", "ok": False,
-                      "error": str(error) if isinstance(error, (BrowserError, WorkflowError)) else traceback.format_exc(limit=8)[-4000:]}
+                      "error": str(error) if isinstance(error, (BrowserError, ServiceError)) else traceback.format_exc(limit=8)[-4000:]}
         try:
             self.save_files()
             changed = helper_path.read_text()

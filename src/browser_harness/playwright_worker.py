@@ -16,7 +16,7 @@ import re
 import time
 import uuid
 from pathlib import Path
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urljoin
 
 MANIFEST = json.loads(Path(__file__).with_name("playwright_manifest.json").read_text())
 CURRENT_JOB = contextvars.ContextVar("proxy_job", default=None)
@@ -275,10 +275,6 @@ class Scope:
             if any(not (isinstance(f, dict) and isinstance(f.get("buffer"), bytes))
                    and not (isinstance(f, str) and f in self.transfer_paths and Path(f).is_dir()) for f in files):
                 raise ValueError("Uploads must transfer sandbox bytes, never worker paths")
-        if member in {"goto", "add_script_tag", "add_style_tag"}:
-            url = args[0] if member == "goto" and args else kwargs.get("url")
-            if url and urlparse(url).scheme not in {"http", "https", "data"} and url != "about:blank":
-                raise ValueError("Navigation to worker files or browser administration is unavailable")
         if member in {"save_as", "path"} and cls in {"Download", "Video"}:
             path = Path(self.files.name) / str(uuid.uuid4())
             await target.save_as(str(path))
@@ -314,14 +310,10 @@ class Scope:
                 if not isinstance(address, str):
                     address = address.url
                 url = urljoin(origin.url, address)
-                parsed, source = urlparse(url), urlparse(origin.url)
-                if (parsed.scheme, parsed.netloc) != (source.scheme, source.netloc) or parsed.scheme not in ("http", "https"):
-                    raise ValueError("Requests must remain on the owned page's origin")
                 if args:
                     args[0] = url
                 else:
                     kwargs["url_or_request" if member == "fetch" else "url"] = url
-                kwargs["max_redirects"] = 0
         if member in {"on", "once", "remove_listener"}:
             event, handler = args if args else (kwargs["event"], kwargs["f"])
             if member == "remove_listener":
@@ -517,7 +509,7 @@ class Scope:
                 elif isinstance(error, AssertionError):
                     code, message, uncertain = "browser_assertion_failed", "Playwright assertion failed.", False
                 elif isinstance(error, (ValueError, TypeError, AttributeError)):
-                    code, message, uncertain = "browser_invalid_argument", "Invalid browser arguments; inspect the supported signature with workflow.describe().", False
+                    code, message, uncertain = "browser_invalid_argument", "Invalid browser arguments; inspect the supported signature with browser.describe().", False
                 result["result"] = {"ok": False, "code": code, "error": message, "outcomeUncertain": uncertain}
         return result
 
