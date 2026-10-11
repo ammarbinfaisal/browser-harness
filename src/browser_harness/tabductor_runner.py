@@ -8,7 +8,11 @@ import contextlib
 import ast
 import functools
 import json
+import os
+import queue
+import signal
 import sys
+import threading
 import traceback
 import base64
 import types
@@ -58,6 +62,39 @@ def validate_compiled_source(source):
 
 
 
+class HostInput:
+    """Host frames, read on a thread so an interrupt can reach a cell that is computing.
+
+    An interrupt raises KeyboardInterrupt in the cell (a real SIGINT also wakes sleeps and
+    blocking waits); outside a cell it is ignored, so it can never end the kernel itself.
+    """
+    def __init__(self, stream):
+        self.lines = queue.Queue()
+        self.executing = False
+        threading.Thread(target=self.read, args=(stream,), daemon=True).start()
+
+    def read(self, stream):
+        for line in stream:
+            if '"interrupt"' in line:
+                try:
+                    frame = json.loads(line)
+                except ValueError:
+                    frame = None
+                if isinstance(frame, dict) and frame.get("type") == "interrupt":
+                    if self.executing:
+                        os.kill(os.getpid(), signal.SIGINT)
+                    continue
+            self.lines.put(line)
+        self.lines.put("")
+
+    def readline(self):
+        return self.lines.get()
+
+    def __iter__(self):
+        while line := self.readline():
+            yield line
+
+
 class CellOutput:
     """Output shares the protocol stream so a result cannot overtake printed text."""
     def __init__(self, wire):
@@ -92,13 +129,6 @@ class Interpreter:
     def call(self, name, args=None):
         if self.loading_helper and not name.startswith("internal."):
             raise RuntimeError("Browser operations belong inside helper functions, not module initialization")
-        if name == "internal.helpers.define":
-            helper_name, source = args["name"], args["source"]
-            tree = ast.parse(source)
-            if not helper_name.isidentifier() or helper_name in ("api", "td"):
-                raise ValueError("helper name must be a public Python identifier other than api/td")
-            if helper_name != "agent_helpers" and not any(isinstance(node, ast.FunctionDef) and node.name == helper_name for node in tree.body):
-                raise ValueError(f"Helper must define {helper_name}")
         self.sequence += 1
         identity = self.sequence
         self.wire_out.write(json.dumps({"type": "call", "id": identity, "name": name, "args": args or {},
@@ -176,6 +206,8 @@ class Interpreter:
         return wrapped
 
     def install_helpers(self, config):
+        # Only compiled artifacts pin helpers now (saved by the retired browser.pyfunc tool);
+        # AI cells define functions directly in the persistent namespace.
         for item in config.get("helpers", []):
             name, revision = item["name"], item["revision"]
             self.call("internal.helpers.use", {"name": name, "revision": revision})
@@ -247,28 +279,33 @@ class Interpreter:
                 validate_compiled_source(helper["source"])
         self.initialize(config)
         self.install_helpers(config)
-        library = next((h for h in config.get("helpers", []) if h["name"] == "agent_helpers"), None)
-        helper_path = self.workspace / "agent_helpers.py"
-        if not helper_path.exists() or library and helper_path.read_text() != library["source"]:
-            helper_path.write_text(library["source"] if library else "")
+        before = {key: id(value) for key, value in self.env.items()}
         result = {"type": "result", "ok": True}
+        interruptible = isinstance(self.wire_in, HostInput)
         try:
             with contextlib.redirect_stdout(self.output), contextlib.redirect_stderr(self.output):
-                exec(program, self.env)
-                if config.get("compiled"):
-                    self.env["run"](self.page, self.context, self.browser)
+                if interruptible:
+                    self.wire_in.executing = True
+                try:
+                    exec(program, self.env)
+                    if config.get("compiled"):
+                        self.env["run"](self.page, self.context, self.browser)
+                finally:
+                    if interruptible:
+                        self.wire_in.executing = False
         except Terminal:
             pass
         except BaseException as error:
             result = {"type": "result", "ok": False,
                       "error": str(error) if isinstance(error, (BrowserError, ServiceError)) else traceback.format_exc(limit=8)[-4000:]}
+        # Names this cell bound or rebound at top level, even when it later raised: the
+        # namespace persists across cells, and the compiler needs to know where names came from.
+        result["namespace"] = {"defined": sorted(key for key, value in self.env.items()
+                                                 if not key.startswith("_") and before.get(key) != id(value))[:200]}
         try:
             self.save_files()
-            changed = helper_path.read_text()
-            if not config.get("compiled") and changed != (library["source"] if library else ""):
-                self.call("internal.helpers.define", {"name": "agent_helpers", "source": changed or "# empty helper module\n"})
         except BaseException:
-            result = {"type": "result", "ok": False, "error": traceback.format_exc(limit=8)[-4000:]}
+            result = {"type": "result", "ok": False, "error": traceback.format_exc(limit=8)[-4000:], "namespace": result["namespace"]}
         if not config.get("repl"):
             try:
                 self.call("playwright.close")
@@ -278,12 +315,12 @@ class Interpreter:
 
 
 def main():
-    wire_in, wire_out = sys.stdin, sys.stdout
+    wire_in, wire_out = HostInput(sys.stdin), sys.stdout
     interpreter = Interpreter(wire_in, wire_out)
     scope = None
     for line in wire_in:
         config = json.loads(line)
-        wire_out.write(json.dumps({"type": "ready", "protocolVersion": 4, "sdkVersion": "playwright-python-v1",
+        wire_out.write(json.dumps({"type": "ready", "protocolVersion": 5, "sdkVersion": "playwright-python-v1",
                                    "sessionId": interpreter.session_id}) + "\n")
         wire_out.flush()
         try:
@@ -300,5 +337,5 @@ def main():
 
 
 if __name__ == "__main__":
-    # --supervise remains the container entry point; one process now owns all cells.
+    # --supervise remains the container entry point; with repl=true one process owns all of a run's cells.
     main()
