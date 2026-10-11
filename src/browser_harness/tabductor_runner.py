@@ -5,7 +5,6 @@ stdout is protocol-only; user output goes to stderr. No browser credentials ente
 this process. The host, not these messages, decides completion and write receipts.
 """
 import contextlib
-import ast
 import functools
 import json
 import os
@@ -22,7 +21,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import browser_harness
 from browser_harness.playwright_proxy import (
-    BrowserError, BrowserTimeoutError, BrowserServices, PUBLIC_EXPORTS, Transport, install_sync_api,
+    BrowserError, BrowserTimeoutError, BrowserServices, Transport, install_sync_api,
 )
 
 
@@ -32,34 +31,6 @@ class Terminal(BaseException):
 
 class ServiceError(Exception):
     """A rejected browser service call, not a bug in the submitted Python program."""
-
-
-def validate_compiled_source(source):
-    """A conservative compilation lint; the container remains the security boundary."""
-    tree = ast.parse(source)
-    forbidden_modules = {"socket", "subprocess", "ctypes", "multiprocessing", "threading", "importlib", "sys", "builtins", "playwright", "camoufox"}
-    forbidden_calls = {"exec", "eval", "compile", "__import__", "getattr", "setattr", "delattr", "globals", "locals", "vars"}
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Import):
-            for name in node.names:
-                if (name.name.split(".")[0] in forbidden_modules and name.name not in {"playwright", "playwright.sync_api"}) or name.name.startswith("browser_harness."):
-                    raise ValueError("Compiled program imports a runtime or ambient-execution module")
-        if isinstance(node, ast.ImportFrom):
-            module = node.module or ""
-            if (module.split(".")[0] in forbidden_modules and module not in {"playwright", "playwright.sync_api"}) or module.startswith("browser_harness."):
-                raise ValueError("Compiled program imports a runtime or ambient-execution module")
-            if module == "playwright" and any(n.name != "sync_api" for n in node.names):
-                raise ValueError("Only playwright.sync_api can be imported")
-            if module == "playwright.sync_api" and any(n.name not in PUBLIC_EXPORTS for n in node.names):
-                raise ValueError("Only public browser objects can be imported")
-            if module == "browser_harness" and any(n.name not in {"expect", "page", "context", "browser"} for n in node.names):
-                raise ValueError("Only public browser objects can be imported")
-        if isinstance(node, ast.Attribute) and node.attr.startswith("_"):
-            raise ValueError("Compiled programs cannot access runtime internals")
-        if isinstance(node, ast.Name) and node.id in forbidden_calls:
-            raise ValueError("Dynamic Python execution and introspection cannot be compiled")
-    return tree
-
 
 
 class HostInput:
@@ -273,10 +244,6 @@ class Interpreter:
             if "await" in error.msg or "async" in error.msg:
                 message += " The browser API is synchronous: use print(page.title()) or page.locator('body').inner_text() without await or async def."
             return {"type": "result", "ok": False, "error": message}
-        if config.get("compiled"):
-            validate_compiled_source(config["source"])
-            for helper in config.get("helpers", []):
-                validate_compiled_source(helper["source"])
         self.initialize(config)
         self.install_helpers(config)
         before = {key: id(value) for key, value in self.env.items()}
