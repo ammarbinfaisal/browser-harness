@@ -311,7 +311,7 @@ BROWSER_METHODS = {
     "emit", "emit.batch", "record.outcome",
     "memory.get", "memory.set", "history.read", "output.read",
     "secrets.fill", "done", "fail", "deopt", "describe", "yield_control",
-    "ai",
+    "ai", "resume",
 }
 
 
