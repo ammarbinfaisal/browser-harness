@@ -21,6 +21,34 @@ from urllib.parse import urljoin
 MANIFEST = json.loads(Path(__file__).with_name("playwright_manifest.json").read_text())
 CURRENT_JOB = contextvars.ContextVar("proxy_job", default=None)
 
+# Playwright call logs can contain page text and typed values, so they never leave the worker.
+# Only these fixed reason codes, matched against the log, are reported with a failure.
+FAILURE_REASONS = (
+    ("multiple_matches", re.compile(r"strict mode violation|resolved to \d+ elements")),
+    ("intercepted_by_other_element", re.compile(r"intercepts pointer events")),
+    ("not_enabled", re.compile(r"element is not enabled|element is not editable|element is disabled")),
+    ("detached", re.compile(r"element is not attached|element was detached|Element is not attached")),
+    ("not_stable", re.compile(r"element is not stable")),
+    ("outside_viewport", re.compile(r"element is outside of the viewport")),
+    ("not_visible", re.compile(r"element is not visible|waiting for element to be visible")),
+    ("waiting_for_navigation", re.compile(r"waiting for (?:scheduled )?navigation|waiting for navigation to finish|navigated to")),
+    ("waiting_for_load_state", re.compile(r'waiting until "(?:load|domcontentloaded|networkidle)"|wait_for_load_state|waiting for load state')),
+    ("no_match", re.compile(r"waiting for (?:get_by_|locator\(|frame_locator)")),
+)
+
+
+def failure_reason(error):
+    """A fixed reason code for a Playwright failure, or None. The last matching log line wins,
+    because Playwright retries and the final state is what blocked the call."""
+    lines = str(error).splitlines()
+    for line in reversed(lines):
+        for code, pattern in FAILURE_REASONS:
+            if code != "no_match" and pattern.search(line):
+                return code
+    if any(FAILURE_REASONS[-1][1].search(line) for line in lines) and not any("resolved to" in line for line in lines):
+        return "no_match"
+    return None
+
 
 class EventExpectation:
     def __init__(self, manager):
@@ -510,7 +538,10 @@ class Scope:
                     code, message, uncertain = "browser_assertion_failed", "Playwright assertion failed.", False
                 elif isinstance(error, (ValueError, TypeError, AttributeError)):
                     code, message, uncertain = "browser_invalid_argument", "Invalid browser arguments; inspect the supported signature with browser.describe().", False
-                result["result"] = {"ok": False, "code": code, "error": message, "outcomeUncertain": uncertain}
+                reason = None if isinstance(error, asyncio.CancelledError) else failure_reason(error)
+                if reason:
+                    message = f"{message} Reason: {reason}."
+                result["result"] = {"ok": False, "code": code, "error": message, "outcomeUncertain": uncertain, **({"reason": reason} if reason else {})}
         return result
 
     def reply(self, ticket, result):
