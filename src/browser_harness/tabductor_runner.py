@@ -397,7 +397,7 @@ class Interpreter:
     def execute(self, config):
         # Compile before initialization: a syntax error must not touch the browser/files.
         try:
-            program = compile(config["source"], "browser.py", "exec")
+            program = compile(config["source"], "script.py" if config.get("compiled") else "browser.py", "exec")
         except SyntaxError as error:
             return {"type": "result", "ok": False, "error": syntax_message(error)}
         self.initialize(config)
